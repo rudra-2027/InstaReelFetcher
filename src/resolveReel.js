@@ -33,6 +33,15 @@ function isVideoContentType(value) {
   return /^video\//i.test(String(value || "").split(";", 1)[0].trim());
 }
 
+function isInstagramCdnUrl(value) {
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" && (url.hostname === "cdninstagram.com" || url.hostname.endsWith(".cdninstagram.com"));
+  } catch {
+    return false;
+  }
+}
+
 function redactCandidateUrl(value) {
   try {
     const url = new URL(value);
@@ -47,13 +56,8 @@ function redactCandidateUrl(value) {
   }
 }
 
-function classifyNetworkCandidate({ url, resourceType, status, contentType, contentLength }) {
+function classifyMediaResponse({ url, resourceType, status, contentType, contentLength }) {
   const normalizedContentType = String(contentType || "").split(";", 1)[0].trim().toLowerCase();
-  const isPotentialCandidate = resourceType === "media" || isDirectVideoUrl(url) || isVideoContentType(contentType);
-  if (!isPotentialCandidate) {
-    return null;
-  }
-
   let reason;
   if (status < 200 || status >= 300) {
     reason = `response status ${status} is not successful`;
@@ -74,6 +78,27 @@ function classifyNetworkCandidate({ url, resourceType, status, contentType, cont
     accepted: reason.startsWith("accepted:"),
     reason,
   };
+}
+
+function classifyNetworkCandidate({ url, resourceType, status, contentType, contentLength }) {
+  const isPotentialCandidate = resourceType === "media" || isDirectVideoUrl(url) || isVideoContentType(contentType);
+  if (!isPotentialCandidate) {
+    return null;
+  }
+
+  return classifyMediaResponse({ url, resourceType, status, contentType, contentLength });
+}
+
+function classifyDirectValidation(response) {
+  const candidate = classifyMediaResponse(response);
+  if (candidate.status !== 200 && candidate.status !== 206) {
+    return {
+      ...candidate,
+      accepted: false,
+      reason: `response status ${candidate.status} is not 200 or 206`,
+    };
+  }
+  return candidate;
 }
 
 function pickVideoCandidate(candidates) {
@@ -107,8 +132,71 @@ async function detectBlockedPage(page) {
     return true;
   }
 
-  const bodyText = await page.evaluate(() => document.body?.innerText || "");
-  return /login|log in|sign up|challenge/i.test(bodyText);
+  const pageState = await page.evaluate(() => ({
+    bodyText: document.body?.innerText || "",
+    hasLoginForm: Boolean(document.querySelector('form input[name="username"], form input[name="password"]')),
+  }));
+  return (
+    (pageState.hasLoginForm && /log in to instagram|login to instagram/i.test(pageState.bodyText)) ||
+    /challenge_required|suspicious login attempt|confirm your identity|enter security code|account has been disabled/i.test(pageState.bodyText)
+  );
+}
+
+async function validateDomCandidateDirectly({ page, url, normalizedUrl, config, logger, reelId }) {
+  logger?.info("DOM_DIRECT_VALIDATION_START", {
+    reelId,
+    source: "dom",
+    method: "head",
+    candidateUrl: redactCandidateUrl(url),
+  });
+
+  try {
+    const response = await page.request.fetch(url, {
+      method: "HEAD",
+      failOnStatusCode: false,
+      maxRedirects: 5,
+      timeout: Math.min(config.browserTimeoutMs, 10000),
+      headers: {
+        Accept: "video/*,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        Referer: normalizedUrl,
+        "User-Agent": MOBILE_DEVICE.userAgent,
+      },
+    });
+    const headers = response.headers();
+    const candidate = classifyDirectValidation({
+      url,
+      resourceType: "direct_head",
+      status: response.status(),
+      contentType: headers["content-type"],
+      contentLength: headers["content-length"] || headers["content-range"],
+    });
+    const logFields = {
+      reelId,
+      source: "dom",
+      method: "head",
+      candidateUrl: redactCandidateUrl(url),
+      responseStatus: candidate.status,
+      contentType: candidate.contentType,
+      contentLength: headers["content-length"] || "",
+      contentRange: headers["content-range"] || "",
+    };
+    logger?.info("DOM_DIRECT_VALIDATION_STATUS", logFields);
+    logger?.info(candidate.accepted ? "DOM_DIRECT_VALIDATION_ACCEPTED" : "DOM_DIRECT_VALIDATION_REJECTED", {
+      ...logFields,
+      reason: candidate.reason,
+    });
+    return candidate;
+  } catch (error) {
+    logger?.info("DOM_DIRECT_VALIDATION_REJECTED", {
+      reelId,
+      source: "dom",
+      method: "head",
+      candidateUrl: redactCandidateUrl(url),
+      reason: `validation request failed: ${error.message}`,
+    });
+    return null;
+  }
 }
 
 function classifyNavigationError(error) {
@@ -242,21 +330,33 @@ function createResolver(config, logger) {
 
       const domUrl = await readVideoFromDom(page);
       const domCandidate = networkCandidates.find((candidate) => candidate.url === domUrl);
+      let validatedDomCandidate = domCandidate;
+      if (isReusableHttpUrl(domUrl) && !domCandidate && isInstagramCdnUrl(domUrl)) {
+        validatedDomCandidate = await validateDomCandidateDirectly({
+          page,
+          url: domUrl,
+          normalizedUrl,
+          config,
+          logger,
+          reelId: normalizedUrl.split("/")[4],
+        });
+      }
+
       if (isReusableHttpUrl(domUrl)) {
         logger?.info("DOM media candidate evaluated", {
           reelId: normalizedUrl.split("/")[4],
           source: "dom",
           method: "dom",
           candidateUrl: redactCandidateUrl(domUrl),
-          resourceType: domCandidate?.resourceType || "unknown",
-          responseStatus: domCandidate?.status || "unknown",
-          contentType: domCandidate?.contentType || "unknown",
-          contentLength: domCandidate?.contentLength || "unknown",
-          decision: domCandidate?.accepted ? "accepted" : "rejected",
-          reason: domCandidate?.reason || "no browser response confirmed video media for DOM URL",
+          resourceType: validatedDomCandidate?.resourceType || "unknown",
+          responseStatus: validatedDomCandidate?.status || "unknown",
+          contentType: validatedDomCandidate?.contentType || "unknown",
+          contentLength: validatedDomCandidate?.contentLength || "unknown",
+          decision: validatedDomCandidate?.accepted ? "accepted" : "rejected",
+          reason: validatedDomCandidate?.reason || "no browser response confirmed video media for DOM URL",
         });
 
-        if (domCandidate?.accepted) {
+        if (validatedDomCandidate?.accepted) {
           return {
             videoUrl: domUrl,
             method: "dom",
@@ -305,8 +405,10 @@ function createResolver(config, logger) {
 
 module.exports = {
   createResolver,
+  classifyDirectValidation,
   classifyNetworkCandidate,
   isDirectVideoUrl,
+  isInstagramCdnUrl,
   isVideoContentType,
   pickVideoCandidate,
   redactCandidateUrl,

@@ -1,7 +1,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
-const { classifyNetworkCandidate, pickVideoCandidate } = require("../src/resolveReel");
+const { classifyDirectValidation, classifyNetworkCandidate, isInstagramCdnUrl, pickVideoCandidate } = require("../src/resolveReel");
 
 test("network candidate rejects a JPEG even when its URL looks like video", () => {
   const candidate = classifyNetworkCandidate({
@@ -38,4 +38,36 @@ test("network candidate rejects non-video success responses", () => {
   });
 
   assert.equal(candidate.accepted, false);
+});
+
+test("direct DOM validation accepts an Instagram CDN video HEAD response", () => {
+  const candidate = classifyDirectValidation({
+    url: "https://scontent.cdninstagram.com/opaque-media-resource",
+    resourceType: "direct_head",
+    status: 200,
+    contentType: "video/mp4",
+    contentLength: "16482493",
+  });
+
+  assert.equal(candidate.accepted, true);
+  assert.equal(isInstagramCdnUrl(candidate.url), true);
+});
+
+test("direct DOM validation rejects image and non-200/206 responses", () => {
+  const image = classifyDirectValidation({
+    url: "https://scontent.cdninstagram.com/opaque-media-resource",
+    resourceType: "direct_head",
+    status: 206,
+    contentType: "image/jpeg",
+  });
+  const forbidden = classifyDirectValidation({
+    url: "https://scontent.cdninstagram.com/opaque-media-resource",
+    resourceType: "direct_head",
+    status: 403,
+    contentType: "video/mp4",
+  });
+
+  assert.equal(image.accepted, false);
+  assert.equal(forbidden.accepted, false);
+  assert.match(forbidden.reason, /not 200 or 206/);
 });
