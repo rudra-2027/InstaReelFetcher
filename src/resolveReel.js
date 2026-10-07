@@ -6,14 +6,6 @@ const MOBILE_DEVICE = devices["iPhone 13"];
 const BLOCKED_PATH_RE = /(login|challenge|accounts\/suspended|consent)/i;
 const DIRECT_VIDEO_RE = /(\.mp4($|\?)|mime_type=video|video_versions|\/v\/t\d+\.\d+-\d+\/)/i;
 
-function logDebug(config, message, extra) {
-  if (!config.debug) {
-    return;
-  }
-
-  console.log(message, extra || "");
-}
-
 function isDirectVideoUrl(value) {
   if (!value || typeof value !== "string") {
     return false;
@@ -123,7 +115,7 @@ async function launchBrowser(config) {
   }
 }
 
-function createResolver(config) {
+function createResolver(config, logger) {
   return async function resolveReel({ normalizedUrl }) {
     let browser;
     let context;
@@ -154,7 +146,7 @@ function createResolver(config) {
         }
       });
 
-      logDebug(config, "Navigating to reel", normalizedUrl);
+      logger?.debug("Navigating to reel", { reelId: normalizedUrl.split("/")[4] });
       await page.goto(normalizedUrl, {
         waitUntil: "domcontentloaded",
         timeout: config.browserTimeoutMs,

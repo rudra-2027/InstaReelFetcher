@@ -17,6 +17,7 @@ function loadConfig() {
     browserTimeoutMs: parseNumber(process.env.BROWSER_TIMEOUT_MS, 20000),
     headless: parseBoolean(process.env.HEADLESS, true),
     debug: parseBoolean(process.env.DEBUG, false),
+    logLevel: process.env.LOG_LEVEL || (parseBoolean(process.env.DEBUG, false) ? "debug" : "info"),
     browserChannel: process.env.BROWSER_CHANNEL || undefined,
     browserExecutablePath: process.env.BROWSER_EXECUTABLE_PATH || undefined,
   };

@@ -2,8 +2,9 @@ const express = require("express");
 
 const { AppError, isAppError } = require("./errors");
 const { normalizeReelUrl, parseInstagramReelUrl } = require("./url");
+const { createLogger } = require("./logger");
 
-function createResolveHandler({ resolver, config = {} }) {
+function createResolveHandler({ resolver, config = {}, logger = createLogger(config) }) {
   return async function resolveHandler(req, res, next) {
     const inputUrl = req.query.url;
     if (!inputUrl || typeof inputUrl !== "string") {
@@ -30,6 +31,7 @@ function createResolveHandler({ resolver, config = {} }) {
     }
 
     const normalizedUrl = normalizeReelUrl(inputUrl);
+    logger.info("Resolving reel", { reelId: parsed.reelId });
 
     try {
       const result = await resolver({
@@ -45,13 +47,14 @@ function createResolveHandler({ resolver, config = {} }) {
         videoUrl: result.videoUrl,
         method: result.method,
       });
+      logger.info("Reel resolved", { reelId: parsed.reelId, method: result.method });
     } catch (error) {
       next(error);
     }
   };
 }
 
-function createErrorHandler(config = {}) {
+function createErrorHandler(config = {}, logger = createLogger(config)) {
   return (error, _req, res, _next) => {
     const handled = isAppError(error)
       ? error
@@ -62,8 +65,16 @@ function createErrorHandler(config = {}) {
           cause: error,
         });
 
-    if (config.debug) {
-      console.error(handled);
+    const fields = {
+      status: handled.status,
+      code: handled.code,
+      stage: handled.stage,
+      error: handled,
+    };
+    if (handled.status >= 500) {
+      logger.error("Request failed", fields);
+    } else {
+      logger.warn("Request rejected", fields);
     }
 
     res.status(handled.status).json({
@@ -76,14 +87,28 @@ function createErrorHandler(config = {}) {
   };
 }
 
-function createApp({ resolver, config = {} }) {
+function createApp({ resolver, config = {}, logger = createLogger(config) }) {
   if (typeof resolver !== "function") {
     throw new Error("resolver must be a function");
   }
 
   const app = express();
-  const resolveHandler = createResolveHandler({ resolver, config });
-  const errorHandler = createErrorHandler(config);
+  const resolveHandler = createResolveHandler({ resolver, config, logger });
+  const errorHandler = createErrorHandler(config, logger);
+
+  app.use((req, res, next) => {
+    const startedAt = process.hrtime.bigint();
+    res.on("finish", () => {
+      const durationMs = Number(process.hrtime.bigint() - startedAt) / 1e6;
+      logger.info("Request completed", {
+        method: req.method,
+        path: req.path,
+        status: res.statusCode,
+        durationMs: Number(durationMs.toFixed(1)),
+      });
+    });
+    next();
+  });
 
   app.get("/health", (_req, res) => {
     res.json({ ok: true });

@@ -85,6 +85,7 @@ Environment variables:
 - `BROWSER_TIMEOUT_MS`: browser timeout in milliseconds. Default `20000`
 - `HEADLESS`: `true` or `false`. Default `true`
 - `DEBUG`: `true` or `false`. Default `false`
+- `LOG_LEVEL`: `debug`, `info`, `warn`, or `error`. Default `info` (`debug` when `DEBUG=true`)
 - `BROWSER_CHANNEL`: optional Playwright browser channel, for example `chrome`
 - `BROWSER_EXECUTABLE_PATH`: optional full path to a browser executable
 
@@ -93,6 +94,8 @@ Example:
 ```bash
 PORT=3000 DEBUG=true npm start
 ```
+
+Logs are emitted as JSON to standard output. Request logs include method, path, status, and duration; direct video URLs are never included.
 
 ## Behavior And Limits
 
