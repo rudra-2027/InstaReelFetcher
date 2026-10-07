@@ -111,7 +111,7 @@ function pickVideoCandidate(candidates) {
   return null;
 }
 
-async function readVideoFromDom(page) {
+async function inspectVideoElement(page) {
   return page.evaluate(() => {
     const video = document.querySelector("video");
     if (!video) {
@@ -122,8 +122,83 @@ async function readVideoFromDom(page) {
       .map((source) => source.src)
       .filter(Boolean);
 
-    return [video.currentSrc, video.src, ...sources].find(Boolean) || null;
+    return {
+      src: video.src || null,
+      currentSrc: video.currentSrc || null,
+      poster: video.poster || null,
+      sources,
+      readyState: video.readyState,
+    };
   });
+}
+
+function pickDomVideoUrl(video) {
+  if (!video) {
+    return null;
+  }
+
+  return [video.currentSrc, video.src, ...video.sources].find(isReusableHttpUrl) || null;
+}
+
+function logVideoElement(logger, reelId, video) {
+  logger?.info("VIDEO_ELEMENT_FOUND", { reelId, found: Boolean(video) });
+  if (!video) {
+    return;
+  }
+
+  logger?.info("VIDEO_SRC", { reelId, value: video.src ? redactCandidateUrl(video.src) : "" });
+  logger?.info("VIDEO_CURRENT_SRC", { reelId, value: video.currentSrc ? redactCandidateUrl(video.currentSrc) : "" });
+  logger?.info("VIDEO_READY_STATE", { reelId, value: video.readyState });
+  logger?.info("VIDEO_POSTER", { reelId, value: video.poster ? redactCandidateUrl(video.poster) : "" });
+  logger?.info("VIDEO_SOURCE_CHILDREN", {
+    reelId,
+    values: video.sources.map(redactCandidateUrl),
+  });
+}
+
+async function triggerMedia(page, logger, reelId) {
+  logger?.info("MEDIA_TRIGGER_ATTEMPT", { reelId });
+  const result = await page.evaluate(async () => {
+    const video = document.querySelector("video");
+    if (!video) {
+      return { triggered: false, reason: "video element not found" };
+    }
+
+    video.scrollIntoView({ block: "center", inline: "center" });
+    video.muted = true;
+    try {
+      await video.play();
+      return { triggered: true, result: "play resolved", readyState: video.readyState };
+    } catch (error) {
+      return { triggered: false, result: "play rejected", reason: error.message, readyState: video.readyState };
+    }
+  });
+  logger?.info("MEDIA_TRIGGER_RESULT", { reelId, ...result });
+  return result;
+}
+
+async function waitForMediaSignal(page, timeoutMs) {
+  const networkResponse = page
+    .waitForResponse(
+      (response) => response.status() >= 200 && response.status() < 300 && isVideoContentType(response.headers()["content-type"]),
+      { timeout: timeoutMs },
+    )
+    .then(() => "network_video_response")
+    .catch(() => null);
+  const domReady = page
+    .waitForFunction(
+      () => {
+        const video = document.querySelector("video");
+        const source = video && Array.from(video.querySelectorAll("source")).find((item) => item.src);
+        return Boolean(video && video.readyState >= HTMLMediaElement.HAVE_METADATA && (video.currentSrc || video.src || source?.src));
+      },
+      undefined,
+      { timeout: timeoutMs },
+    )
+    .then(() => "dom_video_ready")
+    .catch(() => null);
+
+  return Promise.race([networkResponse, domReady]);
 }
 
 async function detectBlockedPage(page) {
@@ -186,15 +261,22 @@ async function validateDomCandidateDirectly({ page, url, normalizedUrl, config, 
       ...logFields,
       reason: candidate.reason,
     });
+    logger?.info("DIRECT_VALIDATION_RESULT", {
+      ...logFields,
+      decision: candidate.accepted ? "accepted" : "rejected",
+      reason: candidate.reason,
+    });
     return candidate;
   } catch (error) {
-    logger?.info("DOM_DIRECT_VALIDATION_REJECTED", {
+    const logFields = {
       reelId,
       source: "dom",
       method: "head",
       candidateUrl: redactCandidateUrl(url),
       reason: `validation request failed: ${error.message}`,
-    });
+    };
+    logger?.info("DOM_DIRECT_VALIDATION_REJECTED", logFields);
+    logger?.info("DIRECT_VALIDATION_RESULT", { ...logFields, decision: "rejected" });
     return null;
   }
 }
@@ -320,7 +402,11 @@ function createResolver(config, logger) {
         timeout: Math.min(config.browserTimeoutMs, 5000),
       }).catch(() => {});
 
-      const networkCandidate = pickVideoCandidate(networkCandidates);
+      const reelId = normalizedUrl.split("/")[4];
+      let video = await inspectVideoElement(page);
+      logVideoElement(logger, reelId, video);
+
+      let networkCandidate = pickVideoCandidate(networkCandidates);
       if (networkCandidate) {
         return {
           videoUrl: networkCandidate.url,
@@ -328,7 +414,34 @@ function createResolver(config, logger) {
         };
       }
 
-      const domUrl = await readVideoFromDom(page);
+      let domUrl = pickDomVideoUrl(video);
+      if (!isReusableHttpUrl(domUrl)) {
+        const mediaWait = waitForMediaSignal(page, Math.min(config.browserTimeoutMs, 5000));
+        await triggerMedia(page, logger, reelId);
+        const mediaSignal = await mediaWait;
+        if (!mediaSignal) {
+          logger?.info("NETWORK_VIDEO_WAIT_TIMEOUT", { reelId });
+        } else {
+          logger?.info("NETWORK_VIDEO_WAIT_RESULT", { reelId, signal: mediaSignal });
+        }
+
+        video = await inspectVideoElement(page);
+        logVideoElement(logger, reelId, video);
+        domUrl = pickDomVideoUrl(video);
+        networkCandidate = pickVideoCandidate(networkCandidates);
+        if (networkCandidate) {
+          return {
+            videoUrl: networkCandidate.url,
+            method: "network",
+          };
+        }
+      }
+
+      logger?.info("DOM_CANDIDATE_FOUND", {
+        reelId,
+        found: isReusableHttpUrl(domUrl),
+        candidateUrl: isReusableHttpUrl(domUrl) ? redactCandidateUrl(domUrl) : "",
+      });
       const domCandidate = networkCandidates.find((candidate) => candidate.url === domUrl);
       let validatedDomCandidate = domCandidate;
       if (isReusableHttpUrl(domUrl) && !domCandidate && isInstagramCdnUrl(domUrl)) {
@@ -338,13 +451,13 @@ function createResolver(config, logger) {
           normalizedUrl,
           config,
           logger,
-          reelId: normalizedUrl.split("/")[4],
+          reelId,
         });
       }
 
       if (isReusableHttpUrl(domUrl)) {
         logger?.info("DOM media candidate evaluated", {
-          reelId: normalizedUrl.split("/")[4],
+          reelId,
           source: "dom",
           method: "dom",
           candidateUrl: redactCandidateUrl(domUrl),
