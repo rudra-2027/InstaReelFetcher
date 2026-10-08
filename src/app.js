@@ -1,4 +1,5 @@
 const express = require("express");
+const { randomUUID } = require("node:crypto");
 
 const { AppError, isAppError } = require("./errors");
 const { normalizeReelUrl, parseInstagramReelUrl } = require("./url");
@@ -31,13 +32,14 @@ function createResolveHandler({ resolver, config = {}, logger = createLogger(con
     }
 
     const normalizedUrl = normalizeReelUrl(inputUrl);
-    logger.info("Resolving reel", { reelId: parsed.reelId });
+    logger.info("Resolving reel", { requestId: req.requestId, reelId: parsed.reelId });
 
     try {
       const result = await resolver({
         inputUrl,
         normalizedUrl,
         reelId: parsed.reelId,
+        requestId: req.requestId,
         config,
       });
 
@@ -47,7 +49,7 @@ function createResolveHandler({ resolver, config = {}, logger = createLogger(con
         videoUrl: result.videoUrl,
         method: result.method,
       });
-      logger.info("Reel resolved", { reelId: parsed.reelId, method: result.method });
+      logger.info("Reel resolved", { requestId: req.requestId, reelId: parsed.reelId, method: result.method });
     } catch (error) {
       next(error);
     }
@@ -55,7 +57,7 @@ function createResolveHandler({ resolver, config = {}, logger = createLogger(con
 }
 
 function createErrorHandler(config = {}, logger = createLogger(config)) {
-  return (error, _req, res, _next) => {
+  return (error, req, res, _next) => {
     const handled = isAppError(error)
       ? error
       : new AppError("Unexpected resolver failure", {
@@ -66,6 +68,7 @@ function createErrorHandler(config = {}, logger = createLogger(config)) {
         });
 
     const fields = {
+      requestId: req.requestId,
       status: handled.status,
       code: handled.code,
       stage: handled.stage,
@@ -97,14 +100,21 @@ function createApp({ resolver, config = {}, logger = createLogger(config) }) {
   const errorHandler = createErrorHandler(config, logger);
 
   app.use((req, res, next) => {
+    req.requestId = randomUUID();
+    res.setHeader("X-Request-Id", req.requestId);
     const startedAt = process.hrtime.bigint();
     res.on("finish", () => {
       const durationMs = Number(process.hrtime.bigint() - startedAt) / 1e6;
       logger.info("Request completed", {
+        requestId: req.requestId,
         method: req.method,
         path: req.path,
         status: res.statusCode,
         durationMs: Number(durationMs.toFixed(1)),
+        memory: (() => {
+          const memory = process.memoryUsage();
+          return { rss: memory.rss, heapUsed: memory.heapUsed, heapTotal: memory.heapTotal };
+        })(),
       });
     });
     next();

@@ -56,6 +56,18 @@ function redactCandidateUrl(value) {
   }
 }
 
+function withLogFields(logger, fields) {
+  if (!logger) {
+    return logger;
+  }
+  return {
+    debug: (message, extra) => logger.debug(message, { ...fields, ...extra }),
+    info: (message, extra) => logger.info(message, { ...fields, ...extra }),
+    warn: (message, extra) => logger.warn(message, { ...fields, ...extra }),
+    error: (message, extra) => logger.error(message, { ...fields, ...extra }),
+  };
+}
+
 function classifyMediaResponse({ url, resourceType, status, contentType, contentLength }) {
   const normalizedContentType = String(contentType || "").split(";", 1)[0].trim().toLowerCase();
   let reason;
@@ -201,20 +213,40 @@ async function waitForMediaSignal(page, timeoutMs) {
   return Promise.race([networkResponse, domReady]);
 }
 
-async function detectBlockedPage(page) {
-  const currentUrl = page.url();
-  if (BLOCKED_PATH_RE.test(currentUrl)) {
-    return true;
-  }
+function sanitizePageText(value) {
+  return String(value || "")
+    .replace(/https?:\/\/\S+/gi, "<url>")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 180);
+}
 
+async function inspectInstagramPage(page, navigationStatus) {
+  const currentUrl = page.url();
   const pageState = await page.evaluate(() => ({
+    title: document.title || "",
     bodyText: document.body?.innerText || "",
+    hasVideo: Boolean(document.querySelector("video")),
     hasLoginForm: Boolean(document.querySelector('form input[name="username"], form input[name="password"]')),
   }));
-  return (
-    (pageState.hasLoginForm && /log in to instagram|login to instagram/i.test(pageState.bodyText)) ||
-    /challenge_required|suspicious login attempt|confirm your identity|enter security code|account has been disabled/i.test(pageState.bodyText)
-  );
+  const text = pageState.bodyText;
+  let classification = "ok";
+  if (/accounts\/login|\/login\//i.test(currentUrl) || pageState.hasLoginForm) {
+    classification = "login_required";
+  } else if (BLOCKED_PATH_RE.test(currentUrl) || /challenge_required|suspicious login attempt|confirm your identity|enter security code|try again later|rate limit/i.test(text)) {
+    classification = "challenge_or_rate_limited";
+  } else if (/page isn'?t available|sorry, this page isn'?t available|reel unavailable|content isn'?t available/i.test(text)) {
+    classification = "reel_unavailable";
+  }
+
+  return {
+    navigationStatus: navigationStatus || null,
+    finalUrl: redactCandidateUrl(currentUrl),
+    title: sanitizePageText(pageState.title),
+    summary: sanitizePageText(text),
+    hasVideo: pageState.hasVideo,
+    classification,
+  };
 }
 
 async function validateDomCandidateDirectly({ page, url, normalizedUrl, config, logger, reelId }) {
@@ -286,19 +318,10 @@ function classifyNavigationError(error) {
     return error;
   }
 
-  if (error && error.name === "TimeoutError") {
-    return new AppError("Extraction timed out", {
-      code: "TIMEOUT",
-      status: 504,
-      stage: "navigate",
-      cause: error,
-    });
-  }
-
-  return new AppError("Unexpected resolver failure", {
-    code: "INTERNAL_ERROR",
-    status: 500,
-    stage: "navigate",
+  return new AppError("Instagram navigation failed", {
+    code: "NAVIGATION_FAILED",
+    status: 502,
+    stage: "navigation_failed",
     cause: error,
   });
 }
@@ -340,7 +363,32 @@ async function launchBrowser(config) {
 }
 
 function createResolver(config, logger) {
-  return async function resolveReel({ normalizedUrl }) {
+  const inFlightByReel = new Map();
+  const pending = [];
+  let activeResolves = 0;
+  let cooldownUntil = 0;
+  const maxConcurrentResolves = config.maxConcurrentResolves || 1;
+  const upstreamCooldownMs = config.upstreamCooldownMs ?? 30000;
+
+  function runWithLimit(operation) {
+    return new Promise((resolve, reject) => {
+      const start = () => {
+        activeResolves += 1;
+        operation().then(resolve, reject).finally(() => {
+          activeResolves -= 1;
+          pending.shift()?.();
+        });
+      };
+      if (activeResolves < maxConcurrentResolves) {
+        start();
+      } else {
+        pending.push(start);
+      }
+    });
+  }
+
+  async function resolveReelOnce({ normalizedUrl, reelId: requestedReelId, requestId }) {
+    const attemptLogger = withLogFields(logger, { requestId });
     let browser;
     let context;
     let page;
@@ -373,7 +421,7 @@ function createResolver(config, logger) {
         });
         if (candidate) {
           networkCandidates.push(candidate);
-          logger?.info("Network media candidate evaluated", {
+          attemptLogger?.info("Network media candidate evaluated", {
             reelId: normalizedUrl.split("/")[4],
             source: "network",
             method: "network",
@@ -388,11 +436,36 @@ function createResolver(config, logger) {
         }
       });
 
-      logger?.debug("Navigating to reel", { reelId: normalizedUrl.split("/")[4] });
-      await page.goto(normalizedUrl, {
+      const reelId = requestedReelId || normalizedUrl.split("/")[4];
+      attemptLogger?.debug("Navigating to reel", { reelId });
+      const navigationResponse = await page.goto(normalizedUrl, {
         waitUntil: "domcontentloaded",
         timeout: config.browserTimeoutMs,
       });
+      const initialPage = await inspectInstagramPage(page, navigationResponse?.status());
+      attemptLogger?.info("Instagram navigation completed", { reelId, ...initialPage });
+      if (initialPage.classification === "login_required") {
+        throw new AppError("Instagram requires login for this reel", {
+          code: "LOGIN_REQUIRED",
+          status: 401,
+          stage: "login_required",
+        });
+      }
+      if (initialPage.classification === "challenge_or_rate_limited") {
+        cooldownUntil = Date.now() + upstreamCooldownMs;
+        throw new AppError("Instagram temporarily blocked or rate-limited this instance", {
+          code: "UPSTREAM_BLOCKED",
+          status: 502,
+          stage: "challenge_or_rate_limited",
+        });
+      }
+      if (initialPage.classification === "reel_unavailable") {
+        throw new AppError("Instagram Reel is unavailable", {
+          code: "REEL_UNAVAILABLE",
+          status: 404,
+          stage: "reel_unavailable",
+        });
+      }
 
       await page.waitForLoadState("networkidle", {
         timeout: Math.min(config.browserTimeoutMs, 5000),
@@ -402,9 +475,8 @@ function createResolver(config, logger) {
         timeout: Math.min(config.browserTimeoutMs, 5000),
       }).catch(() => {});
 
-      const reelId = normalizedUrl.split("/")[4];
       let video = await inspectVideoElement(page);
-      logVideoElement(logger, reelId, video);
+      logVideoElement(attemptLogger, reelId, video);
 
       let networkCandidate = pickVideoCandidate(networkCandidates);
       if (networkCandidate) {
@@ -417,16 +489,16 @@ function createResolver(config, logger) {
       let domUrl = pickDomVideoUrl(video);
       if (!isReusableHttpUrl(domUrl)) {
         const mediaWait = waitForMediaSignal(page, Math.min(config.browserTimeoutMs, 5000));
-        await triggerMedia(page, logger, reelId);
+        await triggerMedia(page, attemptLogger, reelId);
         const mediaSignal = await mediaWait;
         if (!mediaSignal) {
-          logger?.info("NETWORK_VIDEO_WAIT_TIMEOUT", { reelId });
+          attemptLogger?.info("NETWORK_VIDEO_WAIT_TIMEOUT", { reelId });
         } else {
-          logger?.info("NETWORK_VIDEO_WAIT_RESULT", { reelId, signal: mediaSignal });
+          attemptLogger?.info("NETWORK_VIDEO_WAIT_RESULT", { reelId, signal: mediaSignal });
         }
 
         video = await inspectVideoElement(page);
-        logVideoElement(logger, reelId, video);
+        logVideoElement(attemptLogger, reelId, video);
         domUrl = pickDomVideoUrl(video);
         networkCandidate = pickVideoCandidate(networkCandidates);
         if (networkCandidate) {
@@ -437,7 +509,7 @@ function createResolver(config, logger) {
         }
       }
 
-      logger?.info("DOM_CANDIDATE_FOUND", {
+      attemptLogger?.info("DOM_CANDIDATE_FOUND", {
         reelId,
         found: isReusableHttpUrl(domUrl),
         candidateUrl: isReusableHttpUrl(domUrl) ? redactCandidateUrl(domUrl) : "",
@@ -450,13 +522,13 @@ function createResolver(config, logger) {
           url: domUrl,
           normalizedUrl,
           config,
-          logger,
+          logger: attemptLogger,
           reelId,
         });
       }
 
       if (isReusableHttpUrl(domUrl)) {
-        logger?.info("DOM media candidate evaluated", {
+        attemptLogger?.info("DOM media candidate evaluated", {
           reelId,
           source: "dom",
           method: "dom",
@@ -477,11 +549,36 @@ function createResolver(config, logger) {
         }
       }
 
-      if (await detectBlockedPage(page)) {
-        throw new AppError("Instagram blocked extraction for this reel", {
+      const finalPage = await inspectInstagramPage(page, navigationResponse?.status());
+      attemptLogger?.info("Instagram extraction page classification", { reelId, ...finalPage });
+      if (finalPage.classification === "login_required") {
+        throw new AppError("Instagram requires login for this reel", {
+          code: "LOGIN_REQUIRED",
+          status: 401,
+          stage: "login_required",
+        });
+      }
+      if (finalPage.classification === "challenge_or_rate_limited") {
+        cooldownUntil = Date.now() + upstreamCooldownMs;
+        throw new AppError("Instagram temporarily blocked or rate-limited this instance", {
           code: "UPSTREAM_BLOCKED",
           status: 502,
-          stage: "blocked_page",
+          stage: "challenge_or_rate_limited",
+        });
+      }
+      if (finalPage.classification === "reel_unavailable") {
+        throw new AppError("Instagram Reel is unavailable", {
+          code: "REEL_UNAVAILABLE",
+          status: 404,
+          stage: "reel_unavailable",
+        });
+      }
+
+      if (!finalPage.hasVideo) {
+        throw new AppError("Reel video element was not found", {
+          code: "VIDEO_NOT_FOUND",
+          status: 404,
+          stage: "video_not_found",
         });
       }
 
@@ -495,14 +592,6 @@ function createResolver(config, logger) {
         throw error;
       }
 
-      if (page && (await detectBlockedPage(page).catch(() => false))) {
-        throw new AppError("Instagram blocked extraction for this reel", {
-          code: "UPSTREAM_BLOCKED",
-          status: 502,
-          stage: "blocked_page",
-        });
-      }
-
       throw classifyNavigationError(error);
     } finally {
       if (context) {
@@ -513,6 +602,30 @@ function createResolver(config, logger) {
         await browser.close().catch(() => {});
       }
     }
+  }
+
+  return function resolveReel(params) {
+    const reelId = params.reelId || params.normalizedUrl.split("/")[4];
+    const existing = inFlightByReel.get(reelId);
+    if (existing) {
+      logger?.info("Resolve request deduplicated", { requestId: params.requestId, reelId });
+      return existing;
+    }
+
+    if (Date.now() < cooldownUntil) {
+      const retryAfterMs = cooldownUntil - Date.now();
+      logger?.warn("Resolve rejected during upstream cooldown", { requestId: params.requestId, reelId, retryAfterMs });
+      return Promise.reject(new AppError("Instagram cooldown is active after an upstream challenge", {
+        code: "UPSTREAM_COOLDOWN",
+        status: 429,
+        stage: "challenge_or_rate_limited",
+      }));
+    }
+
+    const operation = runWithLimit(() => resolveReelOnce(params));
+    inFlightByReel.set(reelId, operation);
+    operation.finally(() => inFlightByReel.delete(reelId)).catch(() => {});
+    return operation;
   };
 }
 

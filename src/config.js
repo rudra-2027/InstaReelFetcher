@@ -15,6 +15,8 @@ function loadConfig() {
   return {
     port: parseNumber(process.env.PORT, 3000),
     browserTimeoutMs: parseNumber(process.env.BROWSER_TIMEOUT_MS, 20000),
+    maxConcurrentResolves: Math.max(1, parseNumber(process.env.MAX_CONCURRENT_RESOLVES, 1)),
+    upstreamCooldownMs: Math.max(0, parseNumber(process.env.UPSTREAM_COOLDOWN_MS, 30000)),
     headless: parseBoolean(process.env.HEADLESS, true),
     debug: parseBoolean(process.env.DEBUG, false),
     logLevel: process.env.LOG_LEVEL || (parseBoolean(process.env.DEBUG, false) ? "debug" : "info"),
