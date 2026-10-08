@@ -231,7 +231,9 @@ async function inspectInstagramPage(page, navigationStatus) {
   }));
   const text = pageState.bodyText;
   let classification = "ok";
-  if (/accounts\/login|\/login\//i.test(currentUrl) || pageState.hasLoginForm) {
+  if (navigationStatus === 429) {
+    classification = "upstream_rate_limited";
+  } else if (/accounts\/login|\/login\//i.test(currentUrl) || pageState.hasLoginForm) {
     classification = "login_required";
   } else if (BLOCKED_PATH_RE.test(currentUrl) || /challenge_required|suspicious login attempt|confirm your identity|enter security code|try again later|rate limit/i.test(text)) {
     classification = "challenge_or_rate_limited";
@@ -246,6 +248,18 @@ async function inspectInstagramPage(page, navigationStatus) {
     summary: sanitizePageText(text),
     hasVideo: pageState.hasVideo,
     classification,
+  };
+}
+
+function createCooldownState(now = () => Date.now()) {
+  let until = 0;
+  return {
+    activate(durationMs) {
+      until = Math.max(until, now() + durationMs);
+    },
+    remainingMs() {
+      return Math.max(0, until - now());
+    },
   };
 }
 
@@ -366,9 +380,11 @@ function createResolver(config, logger) {
   const inFlightByReel = new Map();
   const pending = [];
   let activeResolves = 0;
-  let cooldownUntil = 0;
+  const challengeCooldown = createCooldownState();
+  const rateLimitCooldown = createCooldownState();
   const maxConcurrentResolves = config.maxConcurrentResolves || 1;
   const upstreamCooldownMs = config.upstreamCooldownMs ?? 30000;
+  const rateLimitCooldownMs = config.rateLimitCooldownMs ?? 300000;
 
   function runWithLimit(operation) {
     return new Promise((resolve, reject) => {
@@ -444,6 +460,16 @@ function createResolver(config, logger) {
       });
       const initialPage = await inspectInstagramPage(page, navigationResponse?.status());
       attemptLogger?.info("Instagram navigation completed", { reelId, ...initialPage });
+      if (initialPage.classification === "upstream_rate_limited") {
+        rateLimitCooldown.activate(rateLimitCooldownMs);
+        throw new AppError("Instagram rate limited this instance", {
+          code: "UPSTREAM_RATE_LIMITED",
+          status: 503,
+          stage: "upstream_rate_limited",
+          retryable: true,
+          retryAfterSeconds: Math.ceil(rateLimitCooldown.remainingMs() / 1000),
+        });
+      }
       if (initialPage.classification === "login_required") {
         throw new AppError("Instagram requires login for this reel", {
           code: "LOGIN_REQUIRED",
@@ -452,7 +478,7 @@ function createResolver(config, logger) {
         });
       }
       if (initialPage.classification === "challenge_or_rate_limited") {
-        cooldownUntil = Date.now() + upstreamCooldownMs;
+        challengeCooldown.activate(upstreamCooldownMs);
         throw new AppError("Instagram temporarily blocked or rate-limited this instance", {
           code: "UPSTREAM_BLOCKED",
           status: 502,
@@ -551,6 +577,16 @@ function createResolver(config, logger) {
 
       const finalPage = await inspectInstagramPage(page, navigationResponse?.status());
       attemptLogger?.info("Instagram extraction page classification", { reelId, ...finalPage });
+      if (finalPage.classification === "upstream_rate_limited") {
+        rateLimitCooldown.activate(rateLimitCooldownMs);
+        throw new AppError("Instagram rate limited this instance", {
+          code: "UPSTREAM_RATE_LIMITED",
+          status: 503,
+          stage: "upstream_rate_limited",
+          retryable: true,
+          retryAfterSeconds: Math.ceil(rateLimitCooldown.remainingMs() / 1000),
+        });
+      }
       if (finalPage.classification === "login_required") {
         throw new AppError("Instagram requires login for this reel", {
           code: "LOGIN_REQUIRED",
@@ -559,7 +595,7 @@ function createResolver(config, logger) {
         });
       }
       if (finalPage.classification === "challenge_or_rate_limited") {
-        cooldownUntil = Date.now() + upstreamCooldownMs;
+        challengeCooldown.activate(upstreamCooldownMs);
         throw new AppError("Instagram temporarily blocked or rate-limited this instance", {
           code: "UPSTREAM_BLOCKED",
           status: 502,
@@ -612,9 +648,22 @@ function createResolver(config, logger) {
       return existing;
     }
 
-    if (Date.now() < cooldownUntil) {
-      const retryAfterMs = cooldownUntil - Date.now();
-      logger?.warn("Resolve rejected during upstream cooldown", { requestId: params.requestId, reelId, retryAfterMs });
+    const rateLimitRetryAfterMs = rateLimitCooldown.remainingMs();
+    if (rateLimitRetryAfterMs) {
+      const retryAfterSeconds = Math.ceil(rateLimitRetryAfterMs / 1000);
+      logger?.warn("Resolve rejected during upstream rate-limit cooldown", { requestId: params.requestId, reelId, retryAfterSeconds });
+      return Promise.reject(new AppError("Instagram rate limit cooldown is active", {
+        code: "UPSTREAM_RATE_LIMITED",
+        status: 503,
+        stage: "upstream_rate_limited",
+        retryable: true,
+        retryAfterSeconds,
+      }));
+    }
+
+    const challengeRetryAfterMs = challengeCooldown.remainingMs();
+    if (challengeRetryAfterMs) {
+      logger?.warn("Resolve rejected during upstream challenge cooldown", { requestId: params.requestId, reelId, retryAfterMs: challengeRetryAfterMs });
       return Promise.reject(new AppError("Instagram cooldown is active after an upstream challenge", {
         code: "UPSTREAM_COOLDOWN",
         status: 429,
@@ -633,6 +682,8 @@ module.exports = {
   createResolver,
   classifyDirectValidation,
   classifyNetworkCandidate,
+  createCooldownState,
+  inspectInstagramPage,
   isDirectVideoUrl,
   isInstagramCdnUrl,
   isVideoContentType,

@@ -85,6 +85,7 @@ Environment variables:
 - `BROWSER_TIMEOUT_MS`: browser timeout in milliseconds. Default `20000`
 - `MAX_CONCURRENT_RESOLVES`: maximum browser resolutions per instance. Default `1`
 - `UPSTREAM_COOLDOWN_MS`: pause after a confirmed Instagram challenge/rate limit. Default `30000`
+- `RATE_LIMIT_COOLDOWN_MS`: pause after an upstream HTTP 429. Default `300000`
 - `HEADLESS`: `true` or `false`. Default `true`
 - `DEBUG`: `true` or `false`. Default `false`
 - `LOG_LEVEL`: `debug`, `info`, `warn`, or `error`. Default `info` (`debug` when `DEBUG=true`)

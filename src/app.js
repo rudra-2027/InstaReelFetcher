@@ -80,11 +80,17 @@ function createErrorHandler(config = {}, logger = createLogger(config)) {
       logger.warn("Request rejected", fields);
     }
 
+    if (handled.retryAfterSeconds) {
+      res.setHeader("Retry-After", String(handled.retryAfterSeconds));
+    }
+
     res.status(handled.status).json({
       error: {
         code: handled.code,
         message: handled.message,
         stage: handled.stage,
+        ...(handled.retryable === undefined ? {} : { retryable: handled.retryable }),
+        ...(handled.retryAfterSeconds ? { retryAfterSeconds: handled.retryAfterSeconds } : {}),
       },
     });
   };

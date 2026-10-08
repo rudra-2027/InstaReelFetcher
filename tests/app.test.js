@@ -8,6 +8,10 @@ function createResponseRecorder() {
   const response = {
     statusCode: 200,
     payload: null,
+    headers: {},
+    setHeader(name, value) {
+      this.headers[name] = value;
+    },
     status(code) {
       this.statusCode = code;
       return this;
@@ -103,5 +107,33 @@ test("error handler maps AppError into structured JSON", () => {
       message: "Direct video URL not found",
       stage: "network_fallback",
     },
+  });
+});
+
+test("error handler returns retry metadata and Retry-After for upstream rate limits", () => {
+  const handler = createErrorHandler();
+  const res = createResponseRecorder();
+
+  handler(
+    new AppError("Instagram rate limited this instance", {
+      code: "UPSTREAM_RATE_LIMITED",
+      status: 503,
+      stage: "upstream_rate_limited",
+      retryable: true,
+      retryAfterSeconds: 300,
+    }),
+    {},
+    res,
+    () => {},
+  );
+
+  assert.equal(res.statusCode, 503);
+  assert.equal(res.headers["Retry-After"], "300");
+  assert.deepEqual(res.payload.error, {
+    code: "UPSTREAM_RATE_LIMITED",
+    message: "Instagram rate limited this instance",
+    stage: "upstream_rate_limited",
+    retryable: true,
+    retryAfterSeconds: 300,
   });
 });

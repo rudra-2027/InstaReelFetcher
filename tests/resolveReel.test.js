@@ -1,7 +1,21 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
-const { classifyDirectValidation, classifyNetworkCandidate, isInstagramCdnUrl, pickVideoCandidate } = require("../src/resolveReel");
+const {
+  classifyDirectValidation,
+  classifyNetworkCandidate,
+  createCooldownState,
+  inspectInstagramPage,
+  isInstagramCdnUrl,
+  pickVideoCandidate,
+} = require("../src/resolveReel");
+
+function fakePage({ url, title = "Instagram", bodyText = "", hasVideo = false, hasLoginForm = false }) {
+  return {
+    url: () => url,
+    evaluate: async () => ({ title, bodyText, hasVideo, hasLoginForm }),
+  };
+}
 
 test("network candidate rejects a JPEG even when its URL looks like video", () => {
   const candidate = classifyNetworkCandidate({
@@ -70,4 +84,54 @@ test("direct DOM validation rejects image and non-200/206 responses", () => {
   assert.equal(image.accepted, false);
   assert.equal(forbidden.accepted, false);
   assert.match(forbidden.reason, /not 200 or 206/);
+});
+
+test("429 navigation takes precedence over an Instagram login redirect", async () => {
+  const state = await inspectInstagramPage(
+    fakePage({
+      url: "https://www.instagram.com/accounts/login/",
+      bodyText: "Log in to Instagram",
+      hasLoginForm: true,
+    }),
+    429,
+  );
+
+  assert.equal(state.classification, "upstream_rate_limited");
+});
+
+test("normal Instagram login page is classified as login_required", async () => {
+  const state = await inspectInstagramPage(
+    fakePage({
+      url: "https://www.instagram.com/accounts/login/",
+      bodyText: "Log in to Instagram",
+      hasLoginForm: true,
+    }),
+    200,
+  );
+
+  assert.equal(state.classification, "login_required");
+});
+
+test("public Reel document remains classified as ok", async () => {
+  const state = await inspectInstagramPage(
+    fakePage({
+      url: "https://www.instagram.com/reel/PublicReel/",
+      title: "Public Reel • Instagram",
+      bodyText: "Watch this Reel",
+      hasVideo: true,
+    }),
+    200,
+  );
+
+  assert.equal(state.classification, "ok");
+  assert.equal(state.hasVideo, true);
+});
+
+test("rate limit cooldown reports remaining time and expires", () => {
+  let now = 1000;
+  const cooldown = createCooldownState(() => now);
+  cooldown.activate(300000);
+  assert.equal(cooldown.remainingMs(), 300000);
+  now += 300000;
+  assert.equal(cooldown.remainingMs(), 0);
 });
